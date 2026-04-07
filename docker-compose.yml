@@ -1,0 +1,300 @@
+networks:
+  taasim-net:
+    driver: bridge
+
+volumes:
+  cassandra-data:
+  kafka-data:
+  flink-checkpoints:
+  spark-data:
+  minio-data:
+  grafana-data:
+  spark-jars:
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123;
+        mc mb --ignore-existing local/raw;
+        mc mb --ignore-existing local/curated;
+        mc mb --ignore-existing local/ml;
+        mc mb --ignore-existing local/kafka-archive;
+        echo 'Buckets créés avec succès';
+      "
+    networks:
+      - taasim-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: "r4kkjTGKRR2DqPIavYDmYA"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: taasim-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - taasim-net
+    depends_on:
+      - kafka
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints
+        s3.endpoint: http://minio:9000
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin123
+        s3.path.style.access: true
+        execution.checkpointing.interval: 60000
+        taskmanager.memory.process.size: 512m
+        jobmanager.memory.process.size: 256m
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    networks:
+      - taasim-net
+    depends_on:
+      - minio
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12
+    container_name: flink-taskmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints
+        s3.endpoint: http://minio:9000
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin123
+        s3.path.style.access: true
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.memory.process.size: 512m
+    networks:
+      - taasim-net
+    depends_on:
+      - flink-jobmanager
+    deploy:
+      resources:
+        limits:
+          memory: 600M
+
+  # ── Init container : télécharge les JARs S3A une seule fois ────────────
+  # Utilise curlimages/curl (curl pré-installé, pas besoin d'apk)
+  spark-jars-init:
+    image: curlimages/curl:latest
+    container_name: spark-jars-init
+    user: root
+    command: >
+      sh -c "
+        cd /jars &&
+        echo 'Téléchargement hadoop-aws...' &&
+        curl --http1.1 -fsSL -o hadoop-aws-3.3.4.jar https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar &&
+        echo 'Téléchargement aws-java-sdk-bundle...' &&
+        curl --http1.1 -fsSL -o aws-java-sdk-bundle-1.12.262.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar &&
+        echo 'JARs prêts :' && ls -lh /jars
+      "
+    volumes:
+      - spark-jars:/jars
+
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    ports:
+      - "4040:4040"
+      - "7077:7077"
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_OPTS: "-Dspark.deploy.defaultCores=2"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    volumes:
+      - spark-jars:/opt/spark/jars/extra
+    networks:
+      - taasim-net
+    depends_on:
+      - minio
+      - spark-jars-init
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 2
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    volumes:
+      - spark-data:/opt/spark/work
+      - spark-jars:/opt/spark/jars/extra
+    networks:
+      - taasim-net
+    depends_on:
+      - spark-master
+      - spark-jars-init
+    deploy:
+      resources:
+        limits:
+          memory: 1200M
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: taasim-cluster
+      CASSANDRA_DC: datacenter1
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "SHOW VERSION"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  fastapi:
+    build: ./api
+    container_name: fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_PORT: 9042
+      CASSANDRA_KEYSPACE: taasim
+      KAFKA_BROKER: kafka:9092
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+      MINIO_BUCKET_RAW: raw
+      MINIO_BUCKET_ML: ml
+      JWT_SECRET: taasim_jwt_secret_local_2026
+      API_PORT: 8000
+    networks:
+      - taasim-net
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: taasim2026
+      GF_INSTALL_PLUGINS: hadesarchitect-cassandra-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - taasim-net
+    depends_on:
+      - cassandra
+    deploy:
+      resources:
+        limits:
+          memory: 256M
