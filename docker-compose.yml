@@ -9,6 +9,7 @@ volumes:
   spark-data:
   minio-data:
   grafana-data:
+  spark-jars:
 
 services:
   minio:
@@ -53,7 +54,6 @@ services:
     networks:
       - taasim-net
 
-  # ✅ KAFKA CORRIGÉ - Avec CLUSTER_ID valide
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
@@ -72,7 +72,6 @@ services:
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
-      # ✅ CLUSTER_ID valide (sans caractères + ou /, sans =)
       CLUSTER_ID: "r4kkjTGKRR2DqPIavYDmYA"
     volumes:
       - kafka-data:/var/lib/kafka/data
@@ -158,6 +157,24 @@ services:
         limits:
           memory: 600M
 
+  # ── Init container : télécharge les JARs S3A une seule fois ────────────
+  # Utilise curlimages/curl (curl pré-installé, pas besoin d'apk)
+  spark-jars-init:
+    image: curlimages/curl:latest
+    container_name: spark-jars-init
+    user: root
+    command: >
+      sh -c "
+        cd /jars &&
+        echo 'Téléchargement hadoop-aws...' &&
+        curl --http1.1 -fsSL -o hadoop-aws-3.3.4.jar https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar &&
+        echo 'Téléchargement aws-java-sdk-bundle...' &&
+        curl --http1.1 -fsSL -o aws-java-sdk-bundle-1.12.262.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar &&
+        echo 'JARs prêts :' && ls -lh /jars
+      "
+    volumes:
+      - spark-jars:/jars
+
   spark-master:
     image: apache/spark:3.5.1
     container_name: spark-master
@@ -169,17 +186,14 @@ services:
       SPARK_MASTER_OPTS: "-Dspark.deploy.defaultCores=2"
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin123
-      SPARK_EXTRA_JAVA_OPTIONS: >
-        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
-        -Dspark.hadoop.fs.s3a.access.key=minioadmin
-        -Dspark.hadoop.fs.s3a.secret.key=minioadmin123
-        -Dspark.hadoop.fs.s3a.path.style.access=true
-        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
     entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    volumes:
+      - spark-jars:/opt/spark/jars/extra
     networks:
       - taasim-net
     depends_on:
       - minio
+      - spark-jars-init
     deploy:
       resources:
         limits:
@@ -195,19 +209,15 @@ services:
       SPARK_WORKER_CORES: 2
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin123
-      SPARK_EXTRA_JAVA_OPTIONS: >
-        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
-        -Dspark.hadoop.fs.s3a.access.key=minioadmin
-        -Dspark.hadoop.fs.s3a.secret.key=minioadmin123
-        -Dspark.hadoop.fs.s3a.path.style.access=true
-        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
     entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     volumes:
       - spark-data:/opt/spark/work
+      - spark-jars:/opt/spark/jars/extra
     networks:
       - taasim-net
     depends_on:
       - spark-master
+      - spark-jars-init
     deploy:
       resources:
         limits:
