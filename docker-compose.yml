@@ -298,3 +298,26 @@ services:
       resources:
         limits:
           memory: 256M
+  jupyter:
+    image: jupyter/pyspark-notebook:python-3.11
+    container_name: jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: "taasim"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - spark-jars:/home/jovyan/extra-jars
+    networks:
+      - taasim-net
+    depends_on:
+      - spark-master
+      - minio
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    restart: unless-stopped
