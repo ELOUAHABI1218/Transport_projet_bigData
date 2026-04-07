@@ -81,7 +81,8 @@ services:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 120s
     deploy:
       resources:
         limits:
@@ -91,7 +92,7 @@ services:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     ports:
-      - "8080:8080"
+      - "8082:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: taasim-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -241,7 +242,8 @@ services:
       test: ["CMD", "cqlsh", "-e", "SHOW VERSION"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 120s
     deploy:
       resources:
         limits:
